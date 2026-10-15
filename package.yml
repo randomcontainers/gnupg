@@ -1,0 +1,153 @@
+name: gnupg
+title: GnuPG
+summary: Encrypts, signs and verifies files with OpenPGP and S/MIME keys using gpg, gpgv, gpgsm and gpgtar. Built from the signed GnuPG 2.5/2.6 release.
+homepage: https://gnupg.org/
+# GnuPG is GPL-3.0-or-later, with some files under LGPL-2.1-or-later or
+# LGPL-3.0-or-later OR GPL-2.0-or-later. dirmngr-client and the certificate,
+# CRL and OCSP code of dirmngr are GPL-2.0-or-later. Compiled in under other
+# terms: libdns in dirmngr (MIT), tinycdb, the database code of dirmngr's CRL
+# cache (public domain), the regular expression code (Spencer-86, and
+# BSD-2-Clause-Views for its UTF-8 helpers) with case tables generated from
+# UnicodeData.txt (Unicode-DFS-2016), and two headers with the FSF
+# all-permissive notice and its warranty disclaimer (FSFULLRWD), which also
+# covers the scripts in sbin. The help texts of the Web Key Directory and mail
+# tools are CC0-1.0.
+license: GPL-3.0-or-later AND GPL-2.0-or-later AND LGPL-2.1-or-later AND (LGPL-3.0-or-later OR GPL-2.0-or-later) AND MIT AND Spencer-86 AND BSD-2-Clause-Views AND Unicode-DFS-2016 AND FSFULLRWD AND CC0-1.0 AND LicenseRef-Public-Domain
+source-release: true
+upstream:
+  source: html-index
+  url: https://gnupg.org/ftp/gcrypt/gnupg/
+  # 2.5 is the stable series that upstream also calls 2.6; 2.4 reached its end
+  # of life on 2026-06-30, and a later odd minor version would be a new
+  # development series. The tarball's Last-Modified header is the release
+  # date.
+  pattern: 'href="gnupg-(2\.[56]\.\d+)\.tar\.bz2"'
+  versioning: semver
+  version: 2.5.24
+  # The second release signature usually reaches the .sig file a day after
+  # the tarball, so most bumps see both.
+  cooldown: 48h
+  artifact:
+    url: https://gnupg.org/ftp/gcrypt/gnupg/gnupg-{version}.tar.bz2
+    signature: https://gnupg.org/ftp/gcrypt/gnupg/gnupg-{version}.tar.bz2.sig
+    sha256: bf149d01a2b9fcc0e4589b8ae8697d3d5c557ea48ed95a3fa55dd3b1187e6039
+image:
+  entrypoint: [gpg]
+  cmd: [--help]
+  env:
+    # gpg creates its home directory itself only when the path ends in
+    # /.gnupg, and /cache can be written by any UID.
+    GNUPGHOME: /cache/.gnupg
+test:
+  - |
+    gpg --version > version.txt
+    test "$(head -n 1 version.txt)" = "gpg (GnuPG) $VERSION" || { echo "gpg --version printed:" >&2; cat version.txt >&2; exit 1; }
+    for want in '^libgcrypt [0-9]+\.[0-9]+\.[0-9]+$' '^Home: /cache/\.gnupg$' '^Compression: Uncompressed, ZIP, ZLIB, BZIP2$'; do
+      grep -Eq "$want" version.txt || { echo "gpg --version has no line matching $want:" >&2; cat version.txt >&2; exit 1; }
+    done
+    for tool in gpgv gpgsm gpg-agent gpgconf gpgtar gpg-connect-agent dirmngr /usr/local/libexec/keyboxd; do
+      "$tool" --version > tool-version.txt
+      test "$(head -n 1 tool-version.txt)" = "${tool##*/} (GnuPG) $VERSION" || { echo "$tool --version printed:" >&2; cat tool-version.txt >&2; exit 1; }
+    done
+    test "$(gpgconf --list-dirs homedir)" = /cache/.gnupg
+    gpgconf --list-components > components.txt
+    awk -F: '{ print $1 ":" $3 }' components.txt > programs.txt
+    for want in gpg:/usr/local/bin/gpg gpgsm:/usr/local/bin/gpgsm keyboxd:/usr/local/libexec/keyboxd gpg-agent:/usr/local/bin/gpg-agent dirmngr:/usr/local/bin/dirmngr pinentry:/usr/bin/pinentry-tty; do
+      grep -qx "$want" programs.txt || { echo "gpgconf --list-components lacks $want:" >&2; cat components.txt >&2; exit 1; }
+    done
+    test -x /usr/bin/pinentry-tty
+    test -s /usr/local/share/gnupg/help.txt
+    for f in /usr/local/libexec/scdaemon /usr/local/libexec/tpm2daemon /usr/local/bin/gpg-card /usr/local/libexec/gpg-auth /usr/local/bin/gpgscm; do
+      test ! -e "$f" || { echo "$f should not be in the image" >&2; exit 1; }
+    done
+  - |
+    # The first command creates the home directory, which then uses keyboxd.
+    gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key 'Test Signer <signer@example.org>' ed25519 sign never
+    grep -qx use-keyboxd /cache/.gnupg/common.conf || { echo "common.conf:" >&2; cat /cache/.gnupg/common.conf >&2; exit 1; }
+    test -s /cache/.gnupg/public-keys.d/pubring.db
+    gpg --batch --with-colons --list-keys signer@example.org > keys.txt
+    fpr=$(awk -F: '$1 == "fpr" { print $10; exit }' keys.txt)
+    test -n "$fpr"
+    printf 'Signed in the gnupg image test.\n' > msg.txt
+    gpg --batch --pinentry-mode loopback --passphrase '' --armor --detach-sign --output msg.txt.asc msg.txt
+    gpg --batch --export --output signer.gpg signer@example.org
+    # gpgv looks up a keyring name without a slash in the home directory.
+    gpgv --status-fd 1 --keyring ./signer.gpg msg.txt.asc msg.txt > good.txt
+    grep -q "^\[GNUPG:\] VALIDSIG $fpr " good.txt || { echo "no valid signature by $fpr:" >&2; cat good.txt >&2; exit 1; }
+    printf 'Changed.\n' >> msg.txt
+    if gpgv --status-fd 1 --keyring ./signer.gpg msg.txt.asc msg.txt > bad.txt 2>&1; then
+      echo "gpgv accepted a changed file" >&2; exit 1
+    fi
+    grep -q '^\[GNUPG:\] BADSIG ' bad.txt || { cat bad.txt >&2; exit 1; }
+    gpgconf --kill all
+  - |
+    # The pqc algorithm string makes a Brainpool P-384 primary key with a
+    # Kyber-768 + Brainpool P-256 encryption subkey, public key algorithm 8.
+    gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key 'PQC Test <pqc@example.org>' pqc default never
+    gpg --batch --with-colons --list-keys pqc@example.org > pqc-keys.txt
+    test "$(awk -F: '$1 == "sub" { print $4 }' pqc-keys.txt)" = 8 || { echo "expected one Kyber subkey:" >&2; cat pqc-keys.txt >&2; exit 1; }
+    head -c 100000 /dev/urandom > plain.bin
+    gpg --batch --trust-model always --recipient pqc@example.org --output plain.bin.gpg --encrypt plain.bin
+    gpg --batch --pinentry-mode loopback --passphrase '' --list-packets plain.bin.gpg > packets.txt
+    grep -Eq '^:pubkey enc packet: version [0-9]+, algo 8, keyid ' packets.txt || { cat packets.txt >&2; exit 1; }
+    gpg --batch --pinentry-mode loopback --passphrase '' --output decrypted.bin --decrypt plain.bin.gpg
+    cmp plain.bin decrypted.bin
+    gpgconf --kill all
+  - |
+    printf 'correct horse battery staple\n' > pass.txt
+    head -c 65536 /dev/urandom > data.bin
+    gpg --batch --pinentry-mode loopback --passphrase-file pass.txt --symmetric --cipher-algo AES256 --output data.bin.gpg data.bin
+    gpg --batch --pinentry-mode loopback --passphrase-file pass.txt --output data.out --decrypt data.bin.gpg
+    cmp data.bin data.out
+    if gpg --batch --pinentry-mode loopback --passphrase wrong --output wrong.out --decrypt data.bin.gpg 2> wrong.log; then
+      echo "decrypted with a wrong passphrase" >&2; exit 1
+    fi
+    mkdir -p tree/sub restored
+    printf 'first\n' > tree/a.txt
+    printf 'second\n' > tree/sub/b.txt
+    # gpgtar --create writes a plain tar and ignores --symmetric; --encrypt
+    # with --symmetric and no recipient encrypts with the passphrase only.
+    args="--pinentry-mode=loopback --passphrase-file=$PWD/pass.txt"
+    gpgtar --batch --gpg-args "$args" --encrypt --symmetric --output tree.gpgtar tree
+    gpg --batch --pinentry-mode loopback --passphrase-file pass.txt --list-packets tree.gpgtar > tar-packets.txt
+    grep -q '^:symkey enc packet: ' tar-packets.txt || { echo "tree.gpgtar is not encrypted with a passphrase:" >&2; cat tar-packets.txt >&2; exit 1; }
+    gpgtar --batch --gpg-args "$args" --list-archive tree.gpgtar > list.txt
+    grep -q ' tree/sub/b\.txt$' list.txt || { cat list.txt >&2; exit 1; }
+    gpgtar --batch --gpg-args "$args" --decrypt --directory restored tree.gpgtar
+    cmp tree/a.txt restored/tree/a.txt
+    cmp tree/sub/b.txt restored/tree/sub/b.txt
+    gpgconf --kill all
+  - |
+    # gpgsm makes a self-signed certificate when the parameters have a serial
+    # number. dirmngr is started by the agent's connect tool, without network.
+    printf '%s\n' 'Key-Type: RSA' 'Key-Length: 2048' 'Key-Usage: sign' 'Serial: random' \
+      'Name-DN: CN=gnupg image test,O=Example' 'Name-Email: smime@example.org' '%no-protection' > cert.parm
+    gpgsm --batch --armor --output cert.pem --gen-key cert.parm
+    grep -qx -- '-----BEGIN CERTIFICATE-----' cert.pem || { cat cert.pem >&2; exit 1; }
+    gpgsm --batch --import cert.pem
+    gpgsm --with-colons --list-secret-keys > certs.txt
+    grep -q '^crs:' certs.txt || { echo 'no certificate with a secret key:' >&2; cat certs.txt >&2; exit 1; }
+    grep -q '^uid:.*CN=gnupg image test' certs.txt || { cat certs.txt >&2; exit 1; }
+    gpg-connect-agent --dirmngr 'GETINFO version' /bye > dirmngr.txt
+    grep -qx "D $VERSION" dirmngr.txt || { cat dirmngr.txt >&2; exit 1; }
+    gpgconf --kill all
+  - |
+    # A home directory on the bind mount, owned by the caller. Without
+    # /run/user/<uid>, the agent puts its socket there too.
+    export GNUPGHOME="$PWD/.gnupg"
+    gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key 'Work Key <work@example.org>' ed25519 sign never
+    test -s .gnupg/common.conf
+    socket=$(gpgconf --list-dirs agent-socket)
+    test "$socket" = "$PWD/.gnupg/S.gpg-agent" || { echo "agent socket is $socket" >&2; exit 1; }
+    gpg --batch --armor --export --output work-key.asc work@example.org
+    grep -qx -- '-----BEGIN PGP PUBLIC KEY BLOCK-----' work-key.asc
+    gpgconf --kill all
+examples:
+  - title: Verify a detached signature with a keyring file
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint gpgv ghcr.io/randomcontainers/gnupg --keyring ./keys.gpg file.tar.gz.sig file.tar.gz
+  - title: Encrypt a file with a passphrase read from a file
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/gnupg --batch --pinentry-mode loopback --passphrase-file pass.txt --symmetric --output file.gpg file
+  - title: Look up a key through the Web Key Directory
+    command: docker run --rm ghcr.io/randomcontainers/gnupg --locate-keys torvalds@kernel.org
+  - title: Import a key into a keyring kept in the mounted directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -e GNUPGHOME=/work/.gnupg ghcr.io/randomcontainers/gnupg --import key.asc
