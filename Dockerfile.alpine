@@ -1,0 +1,137 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS source
+RUN apk add --no-cache bzip2 gpgv tar
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://gnupg.org/ftp/gcrypt/gnupg/gnupg-${VERSION}.tar.bz2 /src/
+ADD https://gnupg.org/ftp/gcrypt/gnupg/gnupg-${VERSION}.tar.bz2.sig /src/
+# The GnuPG release signing keys, from https://gnupg.org/signature_key.asc:
+#   6DAA 6E64 A76D 2840 571B  4902 5288 97B8 2640 3ADA  Werner Koch (dist signing 2020)
+#   AC8E 115B F73E 2D8D 47FA  9908 E98E 9B2D 19C6 C8BD  Niibe Yutaka (GnuPG Release Key)
+#   3B76 1AE4 E63B F351 9CE7  D63B ECB6 64CB E133 2EEF  Alexander Kulbartsch (GnuPG Release Key)
+#   D02A E491 73BD AD56 E4F8  8223 707E 56D3 DEF4 115C  Ingo Klöcker (Release Signing Key 2026)
+#   02F3 8DFF 731F F97C B039  A1DA 549E 695E 905B A208  GnuPG.com (Release Signing Key 2021)
+#   1493 269D E61F 124A A69A  316E 3ADF 34EB DBB2 00A4  GnuPG.com (Release Signing Key 2026)
+# A release usually carries two signatures, and gpgv fails when the key of any
+# of them is missing, so a release signed by anyone else fails here until
+# their key is added to keys/gnupg-release.gpg.
+COPY keys/gnupg-release.gpg /tmp/gnupg-release.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/gnupg-release.gpg "gnupg-${VERSION}.tar.bz2.sig" "gnupg-${VERSION}.tar.bz2"; \
+    mkdir gnupg; \
+    tar -xjf "gnupg-${VERSION}.tar.bz2" -C gnupg --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      build-base \
+      bzip2-dev \
+      gettext-dev \
+      gnutls-dev \
+      libassuan-dev \
+      libgcrypt-dev \
+      libgpg-error-dev \
+      libksba-dev \
+      npth-dev \
+      pkgconf \
+      readline-dev \
+      scanelf \
+      sqlite-dev \
+      zlib-dev
+COPY --link --from=source /src/gnupg /src/gnupg
+WORKDIR /src/gnupg
+ARG JOBS
+ARG VERSION
+# Smartcards (scdaemon), TPMs (tpm2d) and LDAP keyservers are left out: a
+# container rarely reaches a card reader or a TPM, and they would add libusb,
+# PC/SC, TSS and OpenLDAP. configure silently drops dirmngr without a TLS
+# library, keyboxd and TOFU without SQLite, and ZIP, ZLIB and BZIP2 compression
+# without the zlib and bzip2 headers, so the build checks the summary configure
+# prints and config.h. NLS stays on because gpg calls setlocale() only with it;
+# without that, gpg uses the character set of the C locale and prints non-ASCII
+# user IDs escaped. configure looks for GNU gettext, which musl does not
+# provide, so gettext-dev adds libintl. The translations are removed, since the
+# images run with LANG=C.UTF-8. The manual is not built; the help texts that
+# gpg and the mail tools read at run time are installed from doc/ instead.
+# make check runs upstream's test suite. make install also installs gpgscm, the
+# suite's Scheme interpreter, gpg-authcode-sign.sh, a wrapper for Windows code
+# signing with osslsigncode, and the card tools gpg-card and gpg-auth, which
+# work only with scdaemon; all four are removed.
+RUN ./configure \
+      --prefix=/usr/local \
+      --disable-doc \
+      --disable-ldap \
+      --disable-ntbtls \
+      --disable-photo-viewers \
+      --disable-scdaemon \
+      --disable-tpm2d \
+      --with-pinentry-pgm=/usr/bin/pinentry-tty \
+      | tee /tmp/configure.log; \
+    for want in 'OpenPGP: yes' 'S/MIME: yes' 'Agent: yes' 'Smartcard: no' 'TPM: no' \
+      'Dirmngr: yes' 'Keyboxd: yes' 'Gpgtar: yes' 'WKS tools: yes' \
+      'Default pinentry: /usr/bin/pinentry-tty' 'Readline support: yes' \
+      'LDAP support: no' 'TLS support: gnutls' 'TOFU support: yes'; do \
+      grep -Eq "^ +${want%%: *}: +${want#*: } *\$" /tmp/configure.log \
+        || { echo "configure did not report ${want}" >&2; exit 1; }; \
+    done; \
+    for want in ENABLE_NLS HAVE_ZIP HAVE_BZIP2; do \
+      grep -qx "#define ${want} 1" config.h || { echo "config.h does not define ${want}" >&2; exit 1; }; \
+    done; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make check; \
+    make install-strip DESTDIR=/out; \
+    rm -rf /out/usr/local/share/doc /out/usr/local/share/locale; \
+    rm -f /out/usr/local/bin/gpgscm /out/usr/local/bin/gpg-authcode-sign.sh \
+      /out/usr/local/bin/gpg-card /out/usr/local/libexec/gpg-auth; \
+    install -m 644 doc/help.txt doc/mail-tube.txt doc/wks-utils.txt /out/usr/local/share/gnupg/; \
+    /out/usr/local/bin/gpg --version > /tmp/gpg-version; \
+    test "$(head -n 1 /tmp/gpg-version)" = "gpg (GnuPG) ${VERSION}" \
+      || { cat /tmp/gpg-version >&2; exit 1; }
+
+ARG BASE_IMAGE
+# runtime-deps lists the so: names the binaries need, minus the libraries
+# built here, plus the packages in runtime-deps.alpine. pinentry-tty asks for
+# passphrases when a terminal is attached.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    set -eu; \
+    meta=/out/usr/local/share/randomcontainers/gnupg; \
+    mkdir -p "$meta/licenses"; \
+    cp AUTHORS COPYING COPYING.CC0 COPYING.GPL2 COPYING.LGPL21 COPYING.LGPL3 COPYING.other "$meta/licenses/"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://gnupg.org/ftp/gcrypt/gnupg/gnupg-${VERSION}.tar.bz2" \
+      "https://gnupg.org/ftp/gcrypt/gnupg/gnupg-${VERSION}.tar.bz2.sig" \
+      "https://github.com/randomcontainers/gnupg/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "configure: $(sed -n 's/^  \$ \.\/configure //p' config.log)"; \
+      sed -n '/has been configured as follows/,$p' /tmp/configure.log; \
+      cat /tmp/gpg-version; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    test -s /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/gnupg/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache GNUPGHOME=/cache/.gnupg
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "gpg"]
+CMD ["--help"]
